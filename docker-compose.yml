@@ -1,0 +1,16 @@
+services:
+  timeline-audit:
+    build: .
+    image: timeline-audit:latest
+    container_name: timeline-audit
+    ports:
+      - "8000:8000"
+    environment:
+      # uvicorn 日志级别：critical/error/warning/info/debug/trace
+      LOG_LEVEL: info
+    command: >
+      uvicorn app.main:app
+      --host 0.0.0.0
+      --port 8000
+      --log-level ${LOG_LEVEL:-info}
+    restart: unless-stopped
