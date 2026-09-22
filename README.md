@@ -42,7 +42,8 @@ docker compose up --build
 
 端口固定在容器内 `8000`，并在 `docker-compose.yml` 中映射到宿主机 `8000`。
 如需改用宿主机其他端口，修改 compose 文件 `ports` 的左侧即可（如 `18000:8000`）。
-服务无状态、不依赖数据库或外部服务。
+服务不依赖数据库或外部服务；唯一的运行期状态是幂等提交的内存记录
+（详见 [POST /audits](#post-audits)），因此容器固定以单 worker 运行。
 
 ## API
 
@@ -54,7 +55,37 @@ docker compose up --build
 
 提交事件与约束进行核对。
 
-请求体：
+#### 幂等提交（可选）
+
+在请求头携带 `X-Idempotency-Key`（任意由客户端生成的非空字符串，去除首尾
+空白后不超过 255 个字符、仅含可打印 ASCII），即可安全地重试，无需担心重复
+求解或重复生成矛盾闭环：
+
+- 服务端对**规范化后的 JSON 请求体**（递归按字典序排列对象键、去除多余空白，
+  UTF-8 编码）计算 SHA-256 指纹；
+- 同一 key + 同一指纹的并发请求或重试：**只执行一次求解**，其余请求回放首次
+  请求的**完全相同的状态码与响应体**（包括 422 校验失败），并在响应头
+  `X-Idempotency-Replayed` 中标记 `true`（首次请求为 `false`）；
+- 同一 key 对应**不同指纹**：返回 `409`，且**不改变**已有的原结果；
+  如需发起新请求，请更换新的 key；
+- 不带 `X-Idempotency-Key` 时保持原有行为：每次请求照常求解，响应不带
+  `X-Idempotency-Replayed` 头；
+- 非法 key（空、超长、含非可打印 ASCII 字符、重复同名头）仍按现有 `422`
+  规则处理；非法请求体同样仍是 `422`，且不会占用该 key。
+
+幂等记录保存在**进程内存**中（默认最多保留 10 000 条，超出后淘汰最旧的已
+完成记录），容器重启即清空，因此镜像与 compose 均固定 `--workers 1`，
+保证同一容器内同键请求落到同一份记录。
+
+```bash
+curl -s -X POST http://localhost:8000/audits \
+  -H 'Content-Type: application/json' \
+  -H 'X-Idempotency-Key: audit-20260922-0001' \
+  -d '{"events":[{"id":"a","earliest":"2026-09-21T09:00:00Z"}],"constraints":[]}'
+# 原样重试：状态码、响应体与首请求逐字节一致，X-Idempotency-Replayed: true
+```
+
+#### 请求体
 
 ```json
 {
@@ -127,7 +158,22 @@ docker compose up --build
 - 约束引用了未声明的事件；
 - 时间不是 RFC 3339 UTC（非 UTC 时区、非法日期等）；
 - `gap` 不是合法 ISO 8601 duration（含年/月、负数等）；
-- `kind` 未知，或使用了保留前缀 `@` 的 id。
+- `kind` 未知，或使用了保留前缀 `@` 的 id；
+- 携带了非法的 `X-Idempotency-Key`（空、超长、非可打印 ASCII、重复同名头）。
+
+携带幂等键的请求，其 422 也会被记录：同键同内容重试回放原 422，响应头
+`X-Idempotency-Replayed: true`。（请求体本身未通过 JSON/Pydantic 解析的
+422 不占用 key，换用合法请求体可正常首次执行。）
+
+#### 幂等冲突 `409`
+
+同一 `X-Idempotency-Key` 被用于两份规范化指纹不同的请求体：
+
+```json
+{"detail": "幂等键 'audit-20260922-0001' 已用于另一份请求内容（指纹不一致），原结果保持不变；如确需发起新请求，请更换新的幂等键。"}
+```
+
+原结果不受任何影响，使用原请求体 + 原 key 仍可回放到首次结果。
 
 快速验证：
 
@@ -136,6 +182,12 @@ curl -s http://localhost:8000/health
 curl -s -X POST http://localhost:8000/audits \
   -H 'Content-Type: application/json' \
   -d '{"events":[{"id":"a","earliest":"2026-09-21T09:00:00Z"},{"id":"b","latest":"2026-09-21T08:00:00Z"}],"constraints":[{"kind":"at_least","before":"a","after":"b","gap":"PT2H"}]}'
+
+# 幂等提交：第二次（重试）返回逐字节相同的结果，且只求解一次
+curl -s -i -X POST http://localhost:8000/audits \
+  -H 'Content-Type: application/json' \
+  -H 'X-Idempotency-Key: demo-key-1' \
+  -d '{"events":[{"id":"a"}],"constraints":[]}'
 ```
 
 ## 原理
@@ -158,13 +210,14 @@ curl -s -X POST http://localhost:8000/audits \
 
 ```
 app/
-  main.py        FastAPI 入口（/health、/audits）
-  schemas.py     请求/响应模型与时间、时长校验
-  service.py     引用/重复校验、求解编排、矛盾闭环渲染
-  solver.py      差分约束图、Bellman-Ford、负权环还原、收紧界
-  timeutils.py   RFC 3339 UTC 与 ISO 8601 duration 的整数解析/格式化
-tests/           单元、接口与随机穷举对照测试
-Dockerfile       依赖随镜像安装，非 root 运行，内置 HEALTHCHECK
+  main.py          FastAPI 入口（/health、/audits）、幂等头与 OpenAPI 元数据
+  schemas.py       请求/响应模型与时间、时长校验
+  service.py       引用/重复校验、求解编排、矛盾闭环渲染
+  solver.py        差分约束图、Bellman-Ford、负权环还原、收紧界
+  idempotency.py   幂等键校验、规范化 JSON 指纹、并发下单次执行与结果回放
+  timeutils.py     RFC 3339 UTC 与 ISO 8601 duration 的整数解析/格式化
+tests/             单元、接口、幂等并发与随机穷举对照测试
+Dockerfile         依赖随镜像安装，非 root 运行，内置 HEALTHCHECK，固定单 worker
 docker-compose.yml
 ```
 
