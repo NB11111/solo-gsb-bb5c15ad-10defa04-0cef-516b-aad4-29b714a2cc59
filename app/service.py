@@ -85,7 +85,7 @@ def audit(payload: AuditRequest) -> dict:
         return {"feasible": True, "ranges": ranges}
 
     # 4b) 不可行：把负权环映射回原始约束，组成矛盾闭环
-    steps = [_cycle_step(edges[i]) for i in cycle.edge_indices]
+    steps = [_cycle_step(edges[i]).model_dump() for i in cycle.edge_indices]
     count = len(steps)
     explanation = (
         f"闭环包含 {count} 条约束，沿环相加得到 "

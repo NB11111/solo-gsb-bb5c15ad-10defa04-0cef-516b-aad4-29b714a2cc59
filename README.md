@@ -42,7 +42,8 @@ docker compose up --build
 
 端口固定在容器内 `8000`，并在 `docker-compose.yml` 中映射到宿主机 `8000`。
 如需改用宿主机其他端口，修改 compose 文件 `ports` 的左侧即可（如 `18000:8000`）。
-服务无状态、不依赖数据库或外部服务。
+服务无数据库或外部服务依赖；幂等记录保存在进程内存中，故容器以单 worker 运行
+（幂等语义详见下文 [POST /audits](#post-audits)）。
 
 ## API
 
@@ -129,12 +130,47 @@ docker compose up --build
 - `gap` 不是合法 ISO 8601 duration（含年/月、负数等）；
 - `kind` 未知，或使用了保留前缀 `@` 的 id。
 
+#### 幂等提交（`X-Idempotency-Key`）
+
+对可能超时重试的客户端，可在请求头携带 `X-Idempotency-Key` 标识一次审计请求。
+服务端先把请求体交给 Pydantic 校验，再对**规范化后的请求**计算 SHA-256 指纹：
+
+- 指纹基于校验后的值（时间、间隔均已折算为纳秒整数），并按 JSON 键名排序序列化。
+  因此下列写法差异视为同一次请求，重试互相命中：
+  - JSON 键的先后顺序、空白；
+  - `2026-09-21T08:00:00Z` 与 `2026-09-21T08:00:00+00:00`；
+  - 等价值的时长写法，如 `PT1H` 与 `PT60M`。
+- `events` / `constraints` 的**列表顺序参与指纹**（顺序不同即为不同请求）；
+  多余的未知字段在 Pydantic 校验阶段即按 422 拒绝。
+
+规则：
+
+| 情形 | 响应 |
+| --- | --- |
+| 首次提交（key 不存在） | `200`，响应头 `X-Idempotency-Replayed: false`，正常求解 |
+| 同 key + 同指纹重试（含并发） | `200`，`X-Idempotency-Replayed: true`，返回**字节级相同**的状态与结果；并发下只有一个请求真正求解，矛盾闭环只生成一次，后续全部重放 |
+| 同 key + 不同指纹 | `409`，原结果不变；原请求仍可用相同请求体重放 |
+| 求解过程中请求体触发业务 `422` | key 立即释放；客户端修正请求体后可用**同一个 key** 重新提交 |
+| 未提供 key | 完全保持无幂等的原有行为，响应不带任何幂等头 |
+
+`X-Idempotency-Key` 必须是 1–255 个可见 ASCII 字符（不含空格与控制字符），
+非法 key 与非法请求体一样返回 `422`。成功响应会回显
+`X-Idempotency-Key` 与 `X-Idempotency-Replayed` 两个响应头。
+
+并发语义：同一 key 的并发请求在服务端串行化——首个请求成为 LEADER 进入求解，
+其余请求等待；LEADER 完成后，同指纹者拿到同一结果并标记 `replayed: true`，
+不同指纹者收到 `409`。幂等状态保存在进程内存中（无数据库依赖），
+因此容器固定以**单 uvicorn worker** 运行（见 `Dockerfile` /
+`docker-compose.yml`）；服务重启后幂等记录清空。水平扩展多实例时需要把存储
+替换为 Redis 等共享介质。
+
 快速验证：
 
 ```bash
 curl -s http://localhost:8000/health
 curl -s -X POST http://localhost:8000/audits \
   -H 'Content-Type: application/json' \
+  -H 'X-Idempotency-Key: audit-20260922-001' \
   -d '{"events":[{"id":"a","earliest":"2026-09-21T09:00:00Z"},{"id":"b","latest":"2026-09-21T08:00:00Z"}],"constraints":[{"kind":"at_least","before":"a","after":"b","gap":"PT2H"}]}'
 ```
 
@@ -158,13 +194,14 @@ curl -s -X POST http://localhost:8000/audits \
 
 ```
 app/
-  main.py        FastAPI 入口（/health、/audits）
+  main.py        FastAPI 入口（/health、/audits，幂等头与编排）
+  idempotency.py 幂等键校验、规范化指纹（SHA-256）、进程内并发去重存储
   schemas.py     请求/响应模型与时间、时长校验
   service.py     引用/重复校验、求解编排、矛盾闭环渲染
   solver.py      差分约束图、Bellman-Ford、负权环还原、收紧界
   timeutils.py   RFC 3339 UTC 与 ISO 8601 duration 的整数解析/格式化
 tests/           单元、接口与随机穷举对照测试
-Dockerfile       依赖随镜像安装，非 root 运行，内置 HEALTHCHECK
+Dockerfile       依赖随镜像安装，非 root 运行，单 worker，内置 HEALTHCHECK
 docker-compose.yml
 ```
 
